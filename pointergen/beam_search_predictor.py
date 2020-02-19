@@ -18,7 +18,7 @@ class BeamSearchPredictor(Predictor):
     @overrides
     def _json_to_instance(self, json_dict: JsonDict) -> Instance:
         """
-        Expects JSON that looks like ``{"article_lines": "...", "summary_lines": "..."}``.
+        Expects JSON that looks like ``{"article_lines": ["...", "...", ...], "summary_lines": ["...", "...", ...]}``.
         """
         return self._dataset_reader.dict_to_instance(json_dict)
     
