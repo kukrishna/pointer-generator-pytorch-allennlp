@@ -1,9 +1,9 @@
 PointerGenerator network implementation in AllenNLP
 ---
 
-
 This repo contains an implementation of the pointer-generator network from [See et al (2017)](https://arxiv.org/abs/1704.04368) 
-in PyTorch wrapped in the AllenNLP framework.
+in PyTorch wrapped in the AllenNLP framework. You need to use allennlp version 0.8.5
+
 
 #### Running pretrained model
 
@@ -36,7 +36,7 @@ The above command will train the model without the coverage loss. To further tra
 Suppose the serialization directory of the model trained without coverage is `precoverage`. Then run
 
 
-`allennlp train precoverage/config.json --include-package pointergen -s postcoverage -f  --overrides '{"model":{"type":"pointer_generator_withcoverage"}, "trainer":{"num_epochs":1}, "vocabulary": {"extend": true, "directory_path": "precoverage/vocabulary", "max_vocab_size":1}}'`
+`allennlp train precoverage/config.json --include-package pointergen -s postcoverage --overrides '{"model":{"type":"pointer_generator_withcoverage"}, "trainer":{"num_epochs":1}, "vocabulary": {"extend": true, "directory_path": "precoverage/vocabulary", "max_vocab_size":1}}'`
 
 We will discuss why this command looks so ugly later. After running this command, you would be asked if you want to load weigths from a non-coverage model. Enter yes and in the next prompt enter the path to the weights (`precoverage/best.th` in this case)
 
