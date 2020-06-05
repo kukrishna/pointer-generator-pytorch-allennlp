@@ -16,6 +16,8 @@ from tqdm import tqdm_notebook
 
 from allennlp.models import Model
 
+import torch
+
 from torch.nn.utils import clip_grad_norm_
 from allennlp.models.model import Model
 from pointergen.custom_instance import SyncedFieldsInstance
@@ -24,10 +26,27 @@ from overrides import overrides
 from allennlp.data.dataset import Batch
 from allennlp.nn import util
 from allennlp.common.util import START_SYMBOL, END_SYMBOL
-from allennlp.training.metrics import CategoricalAccuracy
+from allennlp.training.metrics import CategoricalAccuracy, Average
+
+from distutils.util import strtobool
+
+import pdb
+
+# torch.autograd.set_detect_anomaly(True)
+
 
 EPS=1e-8
 
+
+
+
+def get_yes_no(message):
+    while True:
+        try:
+            x=input(message)
+            return strtobool(x) 
+        except ValueError:
+            continue
 
     
 def add_with_expansion(A, B):
@@ -55,21 +74,35 @@ class Attention(nn.Module):
         self.total_decoder_hidden_size=total_decoder_hidden_size
         self.attn_vec_size=attn_vec_size
         
+#         Wh_var=Variable(torch.zeros(total_encoder_hidden_size,attn_vec_size), requires_grad=True, name="wh_attn_matrix")
+#         torch.nn.init.xavier_uniform_(Wh_var)
+#         self.Wh=torch.nn.Parameter(Wh_var, requires_grad=True)
+        
         self.Wh_layer=nn.Linear(total_encoder_hidden_size, attn_vec_size, bias=False)
         self.Ws_layer=nn.Linear(total_decoder_hidden_size, attn_vec_size, bias=True)
         self.selector_vector_layer=nn.Linear(attn_vec_size, 1, bias=False)       # called 'v' in see et al
-
         
-    def forward(self, encoded_seq, decoder_state, input_pad_mask):
+        self.Wc_layer=nn.Linear(1, attn_vec_size, bias=False)
+        torch.nn.init.zeros_(self.Wc_layer.weight)
+        
+#         stdv = 1.0 / math.sqrt(self.hidden_size)
+#         intial_attention=uniform_tensor((self.hidden_size, self.attn_vec_size), -stdv, stdv).cuda()
+        
+    def forward(self, encoded_seq, decoder_state, input_pad_mask, coverage=None):
         '''
         encoded seq is batchsizexenc_seqlenxtotal_encoder_hidden_size
         decoder_state is batchsizexdec_seqlenxtotal_decoder_hidden_size
+        coverage = batchsizexdec_seqlenxenc_seqlen
         '''
 
         projected_decstates = self.Ws_layer(decoder_state)
         projected_encstates = self.Wh_layer(encoded_seq)
-
         added_projections=projected_decstates.unsqueeze(2)+projected_encstates.unsqueeze(1)   #batchsizeXdeclenXenclenXattnvecsize
+
+        if coverage is not None:
+            projected_coverage = self.Wc_layer(coverage.unsqueeze(-1))  # shape = batchsize X dec_seqlen x enc_seqlen X attn_vec_size
+            added_projections += projected_coverage
+
         added_projections=torch.tanh(added_projections)
          
         attn_logits=self.selector_vector_layer(added_projections)
@@ -81,9 +114,11 @@ class Attention(nn.Module):
 
         context_vector = torch.sum(encoded_seq.unsqueeze(1)*attn_weights_renormalized.unsqueeze(-1) , dim=-2)
         # shape batchXdec_seqlenXhiddensize
+        # print(context_vector)
 
         return context_vector, attn_weights_renormalized
-        
+     
+
         
     
         
@@ -107,6 +142,8 @@ class CopyMechanism(nn.Module):
             encoder_input = batchxenc_len'''             
         output_probabilities=self.output_probs(output_logits)
 
+        # print(output_probabilities)
+
         batch_size = output_probabilities.size(0)
         output_len = output_probabilities.size(1)
         append_for_copy = torch.zeros((batch_size, output_len, max_oovs)).cuda()
@@ -121,15 +158,17 @@ class CopyMechanism(nn.Module):
 #         Note that padding words donot get any attention because the attention is a masked attention
 
         copy_probabilities=torch.zeros_like(output_probabilities)  # batchXseqlenXoutvocab
-        copy_probabilities.scatter_add_(2, encoder_input, attn_weights)
+        copy_probabilities.scatter_add_(2, encoder_input, attn_weights)        
+
 
         total_probabilities=pgen*output_probabilities+pcopy*copy_probabilities
         return total_probabilities, pgen  # batchXseqlenXoutvocab , batchsizeXseqlenX1
         
-@Model.register("pointer_generator")
+@Model.register("pointer_generator_withcoverage")
 class Seq2Seq(Model):
-    def __init__(self, vocab, hidden_size=256, emb_size=128, num_encoder_layers=1, num_decoder_layers=1, use_copy_mech=True):
+    def __init__(self, vocab, hidden_size=256, emb_size=128, num_encoder_layers=1, num_decoder_layers=1, min_decode_length=0, max_decode_length=9999, use_copy_mech=True, coverage_coef=1.0):
         super().__init__(vocab)
+        # self.vocab=vocab
 
         ## vocab related setup begins
         assert "tokens" in vocab._token_to_index and len(vocab._token_to_index.keys())==1, "Vocabulary must have tokens as the only namespace"
@@ -146,10 +185,19 @@ class Seq2Seq(Model):
         self.num_decoder_layers=num_decoder_layers
         self.crossentropy=nn.CrossEntropyLoss()
 
+        self.min_decode_length = min_decode_length
+        self.max_decode_length = max_decode_length
+
+        self.coverage_coef = coverage_coef
+
         self.metrics = {
             "accuracy" : CategoricalAccuracy(),
+            "coverage_loss": Average(),
+            "nll_loss": Average(),
+            "total_loss": Average(),
                         }
-
+        
+        # buffers because these dont need grads. These are placed here because they will be replicated across gpus
         self.register_buffer("true_rep", torch.tensor(1.0))
         self.register_buffer("false_rep", torch.tensor(0.0))
 
@@ -187,8 +235,20 @@ class Seq2Seq(Model):
         self.project_to_decoder_input = nn.Linear(emb_size+2*hidden_size, emb_size, bias=True)
         
         self.output_projector = torch.nn.Conv1d(self.pre_output_dim, self.vocab_size, kernel_size=1, bias=True)
-        self.softmax = nn.Softmax(dim=-1)        
-    
+        self.softmax = nn.Softmax(dim=-1)
+
+        print("If you intend to train a new coverage-augmented model starting from weights of a non-coverage model, you need to specify the path to the weights file.")
+        print("Otherwise, say no to the question if you intend to do inference or are continuing to train an already coverage-augmented model further using the --recover flag.")
+        if get_yes_no("Do you want to load pretrained weights from a model trained without coverage? [y/n] :"):
+            initial_precoverage_paramfile = input("Enter path to pre-coverage weight-file : ")
+            print(f"Loading precoverage weights from {initial_precoverage_paramfile}")
+            # this will contain path to a .th weights file that contains pre-coverage weights
+            pretrained_dict = torch.load(initial_precoverage_paramfile, map_location="cuda:0")
+            model_dict = self.state_dict()
+            model_dict.update(pretrained_dict)
+            self.load_state_dict(model_dict)
+
+            
 
     def forward(self, source_tokens, target_tokens, meta=None, only_predict_probs=False, return_pgen=False):
         inp_with_unks = source_tokens["ids_with_unks"]
@@ -212,7 +272,7 @@ class Seq2Seq(Model):
         c_value = self.pad_zeros_to_init_state(last_c_value)
         state_from_inp = (h_value, c_value)
 
-        input_pad_mask=torch.where(inp_with_unks!=0, self.true_rep, self.false_rep)
+        input_pad_mask=torch.where(inp_with_unks!=self.PAD_ID, self.true_rep, self.false_rep)
         
         output_embedded = self.output_embedder(feed_tensor)
         seqlen_first = output_embedded.permute(1,0,2)
@@ -220,7 +280,9 @@ class Seq2Seq(Model):
 
         #initial values
         decoder_hidden_state=state_from_inp
+        context_vector=torch.zeros(batch_size,1,2*self.hidden_size).cuda()
 
+        # CONTROVERSIAL DIFFERENCE FROM SEE ET AL
         decoder_hstates_batchfirst = state_from_inp[0].permute(1, 0, 2)
         decoder_cstates_batchfirst = state_from_inp[1].permute(1, 0, 2)
         concatenated_decoder_states = torch.cat([decoder_cstates_batchfirst, decoder_hstates_batchfirst], dim=-1)
@@ -229,7 +291,9 @@ class Seq2Seq(Model):
 
         output_probs=[]
         pgens=[]
-
+        coverages = [torch.zeros_like(inp_with_unks).type(torch.float).cuda()]
+        all_attn_weights = []
+        
         for _i in range(output_seq_len):
             seqlen_first_onetimestep = seqlen_first[_i:_i+1]                # shape is 1xbatchsizexembsize
             context_vector_seqlenfirst = context_vector.permute(1,0,2)     # seqlen is 1 always
@@ -245,7 +309,13 @@ class Seq2Seq(Model):
             decoder_cstates_batchfirst = decoder_hidden_state[1].permute(1, 0, 2)
             concatenated_decoder_states = torch.cat([decoder_cstates_batchfirst, decoder_hstates_batchfirst], dim=-1)
 
-            context_vector, attn_weights = self.attention_layer(inp_enc_seq, concatenated_decoder_states, input_pad_mask)
+            prev_coverage = coverages[-1]
+
+            context_vector, attn_weights = self.attention_layer(inp_enc_seq, concatenated_decoder_states, input_pad_mask, prev_coverage.unsqueeze(1))
+
+            all_attn_weights.append(attn_weights.squeeze(1))
+
+            coverages.append(prev_coverage + attn_weights.squeeze(1))
 
             decstate_and_context=torch.cat([decoder_h_values_batchfirst, context_vector], dim=-1)  #batchsizeXdec_seqlenX3*hidden_size
             prefinal_tensor = self.statenctx_to_prefinal(decstate_and_context)
@@ -253,7 +323,9 @@ class Seq2Seq(Model):
             logits = self.output_projector(seqlen_last)
             logits = logits.permute(0,2,1)   # batchXdec_seqlenXvocab
 
-            # now executing copymechanism
+            # return self.copymech.output_probs(logits)
+
+            # now doing copymechanism
             if self.use_copy_mech:
                 probs_after_copying, pgen = self.copymech(logits, attn_weights, concatenated_decoder_states, input_to_decoder.permute(1,0,2), context_vector, inp_with_oovs, max_oovs)
                 pgens.append(pgen)
@@ -261,12 +333,14 @@ class Seq2Seq(Model):
             else:
                 output_probs.append(self.softmax(logits))
 
+        # if only_predict_probs:
+        #     return output_probs
         
         # now calculating loss and numpreds
         '''outprobs is list of batchX1xvocabsize
         target_tensor is batchXseqlen'''        
         targets_tensor_seqfirst = target_tensor.permute(1,0)
-        pad_mask=torch.where(targets_tensor_seqfirst!=self.PAD_ID, self.true_rep, self.false_rep)
+        target_pad_mask = torch.where(targets_tensor_seqfirst!=self.PAD_ID, self.true_rep, self.false_rep)
         # TODO: SHOULD WE SET REQUIRES_GRAD=FALSE FOR PAD_MASK?
             
         loss=0.0
@@ -283,7 +357,7 @@ class Seq2Seq(Model):
         for _i in range(len(output_probs)):
             predicted_probs = output_probs[_i].squeeze(1)
             true_labels = targets_tensor_seqfirst[_i]
-            mask_labels = pad_mask[_i]      
+            mask_labels = target_pad_mask[_i]
             selected_probs=torch.gather(input=predicted_probs, dim=1, index=true_labels.unsqueeze(1))
             selected_probs=selected_probs.squeeze(1)
             selected_neg_logprobs=-1*torch.log(selected_probs)
@@ -292,8 +366,7 @@ class Seq2Seq(Model):
             this_numpreds=torch.sum(mask_labels).detach()
             numpreds+=this_numpreds
 
-            for metric in self.metrics.values():
-                metric(predicted_probs, true_labels, mask_labels)
+            self.metrics["accuracy"](predicted_probs, true_labels, mask_labels)
 
             if return_pgen:
                 pgen=pgens[_i].squeeze(1).squeeze(1)
@@ -301,19 +374,39 @@ class Seq2Seq(Model):
             
                 total_pgen_placewise[_i]+=torch.sum(pgen*mask_labels).detach()
                 numpreds_placewise[_i]+=this_numpreds
+            
+#             print(pgen.shape, mask_labels.shape , (pgen*mask_labels).shape, selected_neg_logprobs.shape)
+#             print(torch.sum(pgen), torch.sum(pgen*mask_labels), torch.sum(mask_labels).detach())
+
+        coverage_loss = self.coverage_loss(all_attn_weights, target_pad_mask.permute(1,0))  # have to permute to get batcsize to first dim
+        nll_loss = loss/numpreds
+        total_loss = nll_loss + self.coverage_coef*coverage_loss
+    
+        self.metrics["coverage_loss"](coverage_loss.item())
+        self.metrics["nll_loss"](nll_loss.item())
+        self.metrics["total_loss"](total_loss.item())
+            
+        return {
+            "loss": total_loss
+        }
 
 
-        if return_pgen:
-            return {
-                "loss": loss/numpreds,
-                "total_pgen": total_pgen,
-                "numpreds_placewise": numpreds_placewise,
-                "total_pgen_placewise": total_pgen_placewise
-            }
-        else:
-            return {
-                "loss": loss/numpreds
-            }
+    def coverage_loss(self, all_attn_weights, output_padding_mask):
+        '''all_attn_weights is list of elems where each elem is batchsizeXinp_enclen
+        mask is batchsizeXdeclen'''
+        coverages = [torch.zeros_like(all_attn_weights[0])]
+        covlosses = []
+        for a in all_attn_weights:
+            old_coverage = coverages[-1]
+            minimums = torch.min(a, old_coverage)
+            covloss = torch.sum(minimums, dim=1, keepdim=True)
+            covlosses.append(covloss)
+            new_coverage = old_coverage + a
+            coverages.append(new_coverage)
+        concatenated_covlosses = torch.cat(covlosses, dim=1)
+        coverage_loss = torch.sum(concatenated_covlosses*output_padding_mask)/torch.sum(output_padding_mask)
+        return coverage_loss
+
 
             
     def pad_zeros_to_init_state(self, h_value):
@@ -345,9 +438,10 @@ class Seq2Seq(Model):
         return output_seq, (last_layer_h_fused, last_layer_c_fused)
     
         
-    def decode_onestep(self, past_outp_input, past_state_tuple, past_context_vector, inp_enc_seq, inp_with_oovs, input_pad_mask, max_oovs):
+    def decode_onestep(self, past_outp_input, past_state_tuple, past_context_vector, inp_enc_seq, inp_with_oovs, input_pad_mask, max_oovs, past_coverage_vector):
         '''run one step of decoder. outp_input is batchsizex1
-        past_context_vector is batchsizeX1Xtwice_of_hiddensize'''
+        past_context_vector is batchsizeX1Xtwice_of_hiddensize
+        past_coverage_vector is batchsizeXenc_len'''
         outp_embedded = self.output_embedder(past_outp_input)
         tok_seqlen_first = outp_embedded.permute(1,0,2)
         assert(tok_seqlen_first.size(0)==1) # only one timestep allowed
@@ -365,7 +459,7 @@ class Seq2Seq(Model):
         decoder_cstates_batchfirst = decoder_hidden_state[1].permute(1, 0, 2)
         concatenated_decoder_states = torch.cat([decoder_cstates_batchfirst, decoder_hstates_batchfirst], dim=-1)
 
-        context_vector, attn_weights = self.attention_layer(inp_enc_seq, concatenated_decoder_states, input_pad_mask)
+        context_vector, attn_weights = self.attention_layer(inp_enc_seq, concatenated_decoder_states, input_pad_mask, past_coverage_vector.unsqueeze(1))
         
         decstate_and_context=torch.cat([decoder_h_values_batchfirst, context_vector], dim=-1)  #batchsizeXdec_seqlenX3*hidden_size
         prefinal_tensor = self.statenctx_to_prefinal(decstate_and_context)   
@@ -373,15 +467,20 @@ class Seq2Seq(Model):
         logits = self.output_projector(seqlen_last)
         logits = logits.permute(0,2,1)   # batchXdec_seqlenXvocab
 
-        # now executing copymechanism
+
+        # now doing copymechanism
         if self.use_copy_mech:        
             probs_after_copying, _ = self.copymech(logits, attn_weights, concatenated_decoder_states, input_to_decoder.permute(1,0,2), context_vector, inp_with_oovs, max_oovs)        
             prob_to_return = probs_after_copying[0].squeeze(1)
         else:
             prob_to_return = self.softmax(logits).squeeze(1)
-
         
-        return prob_to_return, decoder_hidden_state, context_vector
+#         max_attended = inp_with_oovs[0][torch.argmax(attn_weights)].item()
+#         max_prob = torch.argmax(probs_after_copying[0][0])        
+#         print("Attended=", self.vocab._id2token[max_attended])
+#         print("Maxprob=", self.vocab._id2token[max_prob])
+        
+        return prob_to_return, decoder_hidden_state, context_vector, attn_weights
     
     
     
@@ -410,14 +509,9 @@ class Seq2Seq(Model):
         cuda_device = self._get_prediction_device()
         dataset = Batch([instance])
         dataset.index_instances(self.vocab)
-
-        gt_has_oov = False
-        dataset_tensor_dict = dataset.as_tensor_dict()
-        if self.OOV_ID in dataset_tensor_dict["target_tokens"]["ids_with_unks"]:
-            gt_has_oov = True
-
         model_input = util.move_to_device(dataset.as_tensor_dict(), cuda_device)
-        output_ids = self.beam_search_decode(**model_input)
+        output_ids = self.beam_search_decode(**model_input, min_length=self.min_decode_length, max_length=self.max_decode_length)
+#         output_ids = self.greedy_decode(**model_input, min_length=self.min_decode_length, max_length=self.max_decode_length)
 
         output_words = []
         for _id in output_ids:
@@ -455,12 +549,14 @@ class Seq2Seq(Model):
         first_decoder_hstates_batchfirst = source_encoding[0].permute(1, 0, 2)
         first_decoder_cstates_batchfirst = source_encoding[1].permute(1, 0, 2)
         first_concatenated_decoder_states = torch.cat([first_decoder_cstates_batchfirst, first_decoder_hstates_batchfirst], dim=-1)
-        first_context_vector, _ = self.attention_layer(inp_enc_seq, first_concatenated_decoder_states, input_pad_mask)
-
+        starting_coverage = torch.zeros_like(inp_with_unks).type(torch.float).cuda()
+        first_context_vector, first_attention = self.attention_layer(inp_enc_seq, first_concatenated_decoder_states, input_pad_mask, starting_coverage)
+        
         hypotheses = [   {"dec_state" : source_encoding,
                           "past_context_vector" : first_context_vector,
                           "logprobs" : [0.0],
-                          "out_words" : [self.START_ID]
+                          "out_words" : [self.START_ID],
+                          "coverage" : first_attention.squeeze(1),
                           }  ]
 
         finished_hypotheses = []
@@ -474,20 +570,24 @@ class Seq2Seq(Model):
             new_hypotheses=[]
             for hyp in hypotheses:
                 old_out_words=hyp["out_words"]
+                
+                
                 in_tok=hyp["out_words"][-1]
                 if in_tok>=self.vocab_size:     # this guy is an OOV
                     in_tok=self.OOV_ID
                 old_dec_state=hyp["dec_state"]
                 past_context_vector=hyp["past_context_vector"]
+                past_coverage_vector=hyp["coverage"]
                 old_logprobs=hyp["logprobs"]
-                new_probs, new_dec_state, new_context_vector = self.decode_onestep( torch.tensor([[in_tok]]).cuda(), old_dec_state, past_context_vector, inp_enc_seq, inp_with_oovs, input_pad_mask, max_oovs)
+                new_probs, new_dec_state, new_context_vector, attn_weights = self.decode_onestep( torch.tensor([[in_tok]]).cuda(), old_dec_state, past_context_vector, inp_enc_seq, inp_with_oovs, input_pad_mask, max_oovs, past_coverage_vector)
                 
                 probs, indices = torch.topk(new_probs[0], dim=0, k=2*beam_width)
                 for p, idx in zip(probs, indices):
                     new_dict = {"dec_state" : new_dec_state,
                                 "past_context_vector" : new_context_vector,
                                 "logprobs" : old_logprobs+[float(torch.log(p).detach().cpu().numpy())],
-                                "out_words" : old_out_words+[idx.item()]
+                                "out_words" : old_out_words+[idx.item()],
+                                "coverage": past_coverage_vector+attn_weights.squeeze(1)
                               }
                     new_hypotheses.append(new_dict)
 
@@ -503,15 +603,12 @@ class Seq2Seq(Model):
                 if len(hypotheses) == beam_width or len(finished_hypotheses) == beam_width:
                     break
         
-
         if len(finished_hypotheses)>0:
             final_candidates = finished_hypotheses
         else:
             final_candidates = hypotheses
             
         sorted_final_candidates = sort_hyps(final_candidates)
+
         best_candidate = sorted_final_candidates[0]
-
-        return best_candidate["out_words"] #, best_candidate["log_likelihood"]
-
-
+        return best_candidate["out_words"] 
